@@ -140,51 +140,75 @@ class KataBumpRenew:
                     raise
 
     def _turnstile_solved(self):
-        """检测 Turnstile 是否已通过: 任一 turnstile 隐藏输入有 token / 复选框已勾选"""
+        """检测 Turnstile 是否已通过（原生 find_elements 优先，execute_script 兜底）"""
         try:
-            solved = self.driver.execute_script("""
-            (function(){
-                // 1) 隐藏 token 输入（兼容自定义 response field name）
-                var inputs = document.querySelectorAll(
-                    'input[name*="cf-turnstile"], input[name*="turnstile"]');
-                for (var i = 0; i < inputs.length; i++) {
-                    if (inputs[i].value && inputs[i].value.length > 20) return true;
-                }
-                // 2) widget 内复选框已勾选
-                var w = document.querySelector('.cf-turnstile input[type="checkbox"]');
-                if (w && w.checked) return true;
-                var w2 = document.querySelector('.cf-turnstile input[aria-checked="true"]');
-                if (w2) return true;
-                return false;
-            })()
-            """)
+            # 1) 原生查找 token 输入（走 CDP DOM 通道，不受 Runtime 干扰影响）
+            for inp in self.driver.find_elements(
+                    By.CSS_SELECTOR, 'input[name*="cf-turnstile"], input[name*="turnstile"]'):
+                try:
+                    v = inp.get_attribute('value') or ''
+                except Exception:
+                    v = ''
+                if len(v) > 20:
+                    return True
+            # 2) 复选框勾选状态
+            for cb in self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    '.cf-turnstile input[type="checkbox"], .cf-turnstile input[aria-checked="true"]'):
+                try:
+                    checked = cb.get_attribute('checked')
+                    aria = cb.get_attribute('aria-checked')
+                except Exception:
+                    checked = aria = None
+                if checked or aria == 'true':
+                    return True
+        except Exception:
+            pass
+        # 3) execute_script 兜底（部分环境可用）
+        try:
+            solved = self.driver.execute_script(
+                "var i=document.querySelector('input[name*=\"cf-turnstile\"],input[name*=\"turnstile\"]');"
+                "return !!(i && i.value && i.value.length > 20);")
             return bool(solved)
         except Exception:
             return False
 
     def _turnstile_debug(self):
-        """Turnstile 未通过时输出 DOM 快照，便于排查"""
+        """Turnstile 未通过时输出诊断（原生查询优先，不依赖 execute_script）"""
         try:
-            info = self.driver.execute_script("""
-            (function(){
-                var out = {url: location.href, widget: null, inputs: [], iframes: []};
-                var w = document.querySelector('.cf-turnstile');
-                if (w) out.widget = w.outerHTML.slice(0, 1200);
-                document.querySelectorAll('input').forEach(function(i){
-                    if (/turnstile|captcha/i.test(i.name || '')) {
-                        out.inputs.push({name: i.name, valueLen: (i.value || '').length});
-                    }
-                });
-                document.querySelectorAll('iframe').forEach(function(f){
-                    out.iframes.push((f.src || '').slice(0, 120));
-                });
-                return out;
-            })()
-            """)
-            logger.warning(f"🔍 {self.masked} Turnstile DOM 快照: "
-                           f"{json.dumps(info, ensure_ascii=False)[:2000]}")
+            logger.warning(f"🔍 {self.masked} Turnstile 调试 - URL: {self.driver.current_url}")
+            try:
+                inputs = self.driver.find_elements(By.TAG_NAME, "input")
+                found = []
+                for i in inputs:
+                    try:
+                        name = i.get_attribute('name') or ''
+                    except Exception:
+                        name = ''
+                    if 'turnstile' in name.lower() or 'captcha' in name.lower():
+                        found.append(name)
+                logger.warning(f"🔍 页面 turnstile/captcha 输入({len(found)}): {found}")
+            except Exception as e:
+                logger.warning(f"🔍 inputs 查询失败: {e}")
+            try:
+                iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
+                logger.warning(f"🔍 页面 iframe 数量: {len(iframes)}")
+                for f in iframes[:5]:
+                    try:
+                        src = (f.get_attribute('src') or '')[:100]
+                    except Exception:
+                        src = '?'
+                    logger.warning(f"🔍   iframe src: {src}")
+            except Exception as e:
+                logger.warning(f"🔍 iframes 查询失败: {e}")
+            # 截图存档（随 artifact 上传）
+            try:
+                self.screenshot_path = f"error-{self.user.split('@')[0]}.png"
+                self.driver.save_screenshot(self.screenshot_path)
+            except Exception:
+                pass
         except Exception as e:
-            logger.warning(f"🔍 {self.masked} Turnstile DOM 快照失败: {e}")
+            logger.warning(f"🔍 {self.masked} Turnstile 调试失败: {e}")
 
     def _expand_turnstile(self):
         """展开 Turnstile widget，防止被 overflow:hidden 父容器裁剪"""
@@ -279,7 +303,7 @@ class KataBumpRenew:
                 self._click_turnstile_checkbox()
 
                 # 轮询 token
-                for _ in range(8):
+                for _ in range(6):
                     if self._turnstile_solved():
                         logger.info(f"✅ {self.masked} [{context}] Turnstile 通过 (第 {attempt+1} 次)")
                         sleep_ms(1500 + random.random() * 1000)
@@ -322,9 +346,9 @@ class KataBumpRenew:
             raise Exception("未找到密码输入框")
         sleep_ms(2000 + random.random() * 1000)
 
-        # Turnstile（失败则中止登录）
+        # Turnstile: 点击复选框（检测仅供参考，不阻断提交——以登录后 URL 跳转为准）
         if not self._handle_turnstile("Login"):
-            raise Exception("Turnstile 验证未通过，无法登录")
+            logger.warning(f"⚠️ {self.masked} Turnstile 未检测到 token，仍尝试提交登录")
 
         # 登录
         logger.info(f"📤 {self.masked} 提交登录...")
