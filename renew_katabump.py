@@ -75,10 +75,11 @@ def send_tg(text, photo_path=None):
     full = f"🔄 KataBump 续期通知\n\n时间: {ts}\n\n{text}"
     try:
         if photo_path and os.path.exists(photo_path):
-            requests.post(
-                f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto",
-                data={"chat_id": TG_CHAT_ID, "caption": full},
-                files={'photo': open(photo_path, 'rb')}, timeout=20)
+            with open(photo_path, 'rb') as f:
+                requests.post(
+                    f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto",
+                    data={"chat_id": TG_CHAT_ID, "caption": full},
+                    files={'photo': f}, timeout=20)
         else:
             requests.post(
                 f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
@@ -138,36 +139,120 @@ class KataBumpRenew:
                 if v is None:
                     raise
 
-    def _handle_turnstile(self, context=""):
-        """Cloudflare Turnstile — ActionChains 偏移点击"""
+    def _turnstile_solved(self):
+        """检查 Turnstile token 是否已生成"""
         try:
-            container = WebDriverWait(self.driver, 15).until(
-                EC.presence_of_element_located((By.CLASS_NAME, "cf-turnstile")))
-            size = container.size
-            base_x = -(size['width'] / 2) + (size['width'] * 0.12)
-            rand_x = base_x + random.uniform(-5, 5)
-            rand_y = random.uniform(-5, 5)
+            return bool(self.driver.execute_script(
+                '(function(){'
+                'var i = document.querySelector(\'input[name="cf-turnstile-response"]\');'
+                'return !!(i && i.value && i.value.length > 20);'
+                '})();'))
+        except Exception:
+            return False
 
+    def _expand_turnstile(self):
+        """展开 Turnstile widget，防止被 overflow:hidden 父容器裁剪"""
+        try:
+            self.driver.execute_script("""
+            (function() {
+                var ts = document.querySelector('input[name="cf-turnstile-response"]');
+                if (!ts) return 'no-turnstile';
+                var el = ts;
+                for (var i = 0; i < 20; i++) {
+                    el = el.parentElement;
+                    if (!el) break;
+                    var s = window.getComputedStyle(el);
+                    if (s.overflow === 'hidden' || s.overflowX === 'hidden' || s.overflowY === 'hidden')
+                        el.style.overflow = 'visible';
+                    el.style.minWidth = 'max-content';
+                }
+                document.querySelectorAll('iframe').forEach(function(f){
+                    if (f.src && f.src.indexOf('challenges.cloudflare.com') !== -1) {
+                        f.style.width = '300px'; f.style.height = '65px';
+                        f.style.minWidth = '300px';
+                        f.style.visibility = 'visible'; f.style.opacity = '1';
+                    }
+                });
+                return 'done';
+            })()
+            """)
+        except Exception as e:
+            logger.warning(f"⚠️ {self.masked} 展开 Turnstile 失败: {e}")
+
+    def _click_turnstile_checkbox(self):
+        """按 iframe 真实坐标点击复选框，失败则退回容器偏移点击"""
+        try:
+            iframe = self.driver.find_element(
+                By.CSS_SELECTOR,
+                ".cf-turnstile iframe[src*='challenges.cloudflare.com']")
+            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", iframe)
+            sleep_ms(300 + random.random() * 300)
+            r = iframe.rect
+            cx = r['width'] * 0.12 + random.uniform(-4, 4)
+            cy = r['height'] / 2 + random.uniform(-4, 4)
             actions = ActionChains(self.driver)
-            actions.move_to_element(container)
-            actions.pause(random.uniform(0.5, 0.8))
-            actions.move_to_element_with_offset(container, rand_x, rand_y)
+            actions.move_to_element_with_offset(iframe, cx, cy)
+            actions.pause(random.uniform(0.4, 0.7))
             actions.click_and_hold()
             actions.pause(random.uniform(0.1, 0.25))
             actions.release()
             actions.perform()
-            logger.info(f"🖱️ {self.masked} [{context}] Turnstile 偏移点击")
+            logger.info(f"🖱️ {self.masked} Turnstile iframe 坐标点击 ({cx:.0f}, {cy:.0f})")
+            return True
+        except Exception as e:
+            logger.warning(f"⚠️ {self.masked} iframe 定位失败: {e}，退回容器偏移点击")
+            try:
+                container = self.driver.find_element(By.CLASS_NAME, "cf-turnstile")
+                size = container.size
+                base_x = -(size['width'] / 2) + (size['width'] * 0.12)
+                rand_x = base_x + random.uniform(-5, 5)
+                rand_y = random.uniform(-5, 5)
+                actions = ActionChains(self.driver)
+                actions.move_to_element(container)
+                actions.pause(random.uniform(0.5, 0.8))
+                actions.move_to_element_with_offset(container, rand_x, rand_y)
+                actions.click_and_hold()
+                actions.pause(random.uniform(0.1, 0.25))
+                actions.release()
+                actions.perform()
+                logger.info(f"🖱️ {self.masked} Turnstile 容器偏移点击")
+                return True
+            except Exception as e2:
+                logger.error(f"❌ {self.masked} Turnstile 点击失败: {e2}")
+                return False
 
-            # 轮询 token
-            for _ in range(15):
-                token = self.driver.execute_script(
-                    'return document.querySelector("input[name=\'cf-turnstile-response\']").value;')
-                if token and len(token) > 20:
-                    logger.info(f"✅ {self.masked} [{context}] Turnstile 通过!")
+    def _handle_turnstile(self, context="", max_attempts=6):
+        """Cloudflare Turnstile — 展开 widget + 重试点击复选框"""
+        try:
+            container = WebDriverWait(self.driver, 15).until(
+                EC.presence_of_element_located((By.CLASS_NAME, "cf-turnstile")))
+
+            # 静默通过直接返回
+            if self._turnstile_solved():
+                logger.info(f"✅ {self.masked} [{context}] Turnstile 已静默通过")
+                sleep_ms(1500 + random.random() * 1000)
+                return True
+
+            self._expand_turnstile()
+
+            for attempt in range(max_attempts):
+                if self._turnstile_solved():
+                    logger.info(f"✅ {self.masked} [{context}] Turnstile 通过 (第 {attempt+1} 次)")
                     sleep_ms(1500 + random.random() * 1000)
                     return True
-                sleep_ms(1000)
-            logger.warning(f"⚠️ {self.masked} [{context}] Turnstile 超时")
+
+                self._expand_turnstile()
+                self._click_turnstile_checkbox()
+
+                # 轮询 token
+                for _ in range(8):
+                    if self._turnstile_solved():
+                        logger.info(f"✅ {self.masked} [{context}] Turnstile 通过 (第 {attempt+1} 次)")
+                        sleep_ms(1500 + random.random() * 1000)
+                        return True
+                    sleep_ms(1000)
+
+            logger.warning(f"⚠️ {self.masked} [{context}] Turnstile {max_attempts} 次尝试均超时")
             return False
         except Exception as e:
             logger.error(f"❌ {self.masked} [{context}] Turnstile 失败: {e}")
@@ -202,8 +287,9 @@ class KataBumpRenew:
             raise Exception("未找到密码输入框")
         sleep_ms(2000 + random.random() * 1000)
 
-        # Turnstile
-        self._handle_turnstile("Login")
+        # Turnstile（失败则中止登录）
+        if not self._handle_turnstile("Login"):
+            raise Exception("Turnstile 验证未通过，无法登录")
 
         # 登录
         logger.info(f"📤 {self.masked} 提交登录...")
@@ -325,16 +411,26 @@ class KataBumpRenew:
             except Exception as e:
                 last_error = str(e)[:80]
                 logger.error(f"❌ {self.masked} 第 {attempt+1} 次: {e}")
+                # 失败时先截图再关闭驱动
                 if self.driver:
+                    try:
+                        self.screenshot_path = f"error-{self.user.split('@')[0]}.png"
+                        self.driver.save_screenshot(self.screenshot_path)
+                    except Exception:
+                        pass
                     try: self.driver.quit()
                     except: pass
                     self.driver = None
                 if attempt < max_retries - 1:
                     sleep_ms(5000 + random.random() * 5000)
 
-        self.screenshot_path = f"error-{self.user.split('@')[0]}.png"
-        if self.driver:
-            self.driver.save_screenshot(self.screenshot_path)
+        # 兜底截图（非异常失败路径）
+        if not self.screenshot_path and self.driver:
+            try:
+                self.screenshot_path = f"error-{self.user.split('@')[0]}.png"
+                self.driver.save_screenshot(self.screenshot_path)
+            except Exception:
+                pass
         return False, f"❌ {self.masked}\n{max_retries} 次尝试均失败\n{last_error}"
 
 
@@ -387,7 +483,8 @@ def main():
         logger.info(f"\n{'='*30}\n📋 第 {i+1}/{len(accounts)} 个账号")
         bot = KataBumpRenew(acc['user'], acc['pass'])
         success, msg = bot.run()
-        results.append({'msg': msg, 'ok': success})
+        results.append({'msg': msg, 'ok': success,
+                        'screenshot': getattr(bot, 'screenshot_path', None)})
         if success:
             success_count += 1
 
@@ -403,11 +500,16 @@ def main():
             logger.info(f"⏳ 等待 {wait/1000:.0f}s...")
             sleep_ms(wait)
 
-    # 汇总
+    # 汇总（失败时附带截图发 TG）
     summary = f"📊 续期汇总: {success_count}/{len(accounts)} 成功\n\n"
     summary += "\n\n".join([r['msg'] for r in results])
     logger.info(summary)
-    send_tg(summary)
+    screenshot = next((r['screenshot'] for r in results
+                       if r.get('screenshot') and os.path.exists(r['screenshot'])), None)
+    if screenshot:
+        send_tg(summary, photo_path=screenshot)
+    else:
+        send_tg(summary)
 
     sys.exit(0 if success_count == len(accounts) else 1)
 
