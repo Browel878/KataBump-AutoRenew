@@ -27,7 +27,12 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 # ===================== 配置 =====================
 HEADLESS = os.getenv('HEADLESS', 'false').lower() == 'true'
 ACCOUNTS_ENV = os.getenv('ACCOUNTS', os.getenv('USERS_JSON', ''))
-PROXY_SERVER = os.getenv('HTTP_PROXY', '')
+# 代理: NODE_LINK 代理由 workflow 的 setup_proxy.sh 生成 sing-box 配置后写入
+# IS_PROXY=true / PROXY_SERVER=socks5://127.0.0.1:1080 环境变量；HTTP_PROXY 作为兼容后备
+IS_PROXY = os.getenv('IS_PROXY', 'false').lower() == 'true'
+PROXY_SERVER = (os.getenv('PROXY_SERVER', '') or os.getenv('HTTP_PROXY', '') or '').strip()
+if IS_PROXY and not PROXY_SERVER:
+    PROXY_SERVER = 'http://127.0.0.1:1081'
 TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN', os.getenv('BOT_TOKEN', ''))
 TG_CHAT_ID = os.getenv('TG_CHAT_ID', os.getenv('CHAT_ID', ''))
 
@@ -100,7 +105,10 @@ class KataBumpRenew:
         opts.add_argument('--disable-blink-features=AutomationControlled')
         opts.add_argument('--remote-debugging-port=9222')
         if PROXY_SERVER:
+            logger.info(f"🔗 挂载代理: {PROXY_SERVER}")
             opts.add_argument(f'--proxy-server={PROXY_SERVER}')
+        else:
+            logger.info("🌐 未使用代理，直连访问")
 
         v_env = os.getenv('CHROME_VERSION', '')
         v_main = int(v_env) if v_env.isdigit() else None

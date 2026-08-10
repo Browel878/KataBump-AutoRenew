@@ -34,6 +34,7 @@ KataBump 免费服务器自动续期，基于 **Python + Playwright + CDP** 绕�
 
 | Secret | 说明 | 格式 |
 |--------|------|------|
+| `NODE_LINK` | 订阅节点链接，配置后走 sing-box 代理登录（GitHub Action IP 被拦时必配） | `vless://...` / `vmess://...` / `hysteria2://...` 等 |
 | `HY2_PROXY_URL` | Hysteria2 代理 | `hysteria2://auth@host:port?sni=xxx` |
 | `HTTP_PROXY` | HTTP 代理 | `http://host:port` |
 | `SOCKS_PORT` | SOCKS5 端口 | `51080` (默认) |
