@@ -140,24 +140,60 @@ class KataBumpRenew:
                     raise
 
     def _turnstile_solved(self):
-        """检查 Turnstile token 是否已生成"""
+        """检测 Turnstile 是否已通过: 任一 turnstile 隐藏输入有 token / 复选框已勾选"""
         try:
-            return bool(self.driver.execute_script(
-                '(function(){'
-                'var i = document.querySelector(\'input[name="cf-turnstile-response"]\');'
-                'return !!(i && i.value && i.value.length > 20);'
-                '})();'))
+            solved = self.driver.execute_script("""
+            (function(){
+                // 1) 隐藏 token 输入（兼容自定义 response field name）
+                var inputs = document.querySelectorAll(
+                    'input[name*="cf-turnstile"], input[name*="turnstile"]');
+                for (var i = 0; i < inputs.length; i++) {
+                    if (inputs[i].value && inputs[i].value.length > 20) return true;
+                }
+                // 2) widget 内复选框已勾选
+                var w = document.querySelector('.cf-turnstile input[type="checkbox"]');
+                if (w && w.checked) return true;
+                var w2 = document.querySelector('.cf-turnstile input[aria-checked="true"]');
+                if (w2) return true;
+                return false;
+            })()
+            """)
+            return bool(solved)
         except Exception:
             return False
+
+    def _turnstile_debug(self):
+        """Turnstile 未通过时输出 DOM 快照，便于排查"""
+        try:
+            info = self.driver.execute_script("""
+            (function(){
+                var out = {url: location.href, widget: null, inputs: [], iframes: []};
+                var w = document.querySelector('.cf-turnstile');
+                if (w) out.widget = w.outerHTML.slice(0, 1200);
+                document.querySelectorAll('input').forEach(function(i){
+                    if (/turnstile|captcha/i.test(i.name || '')) {
+                        out.inputs.push({name: i.name, valueLen: (i.value || '').length});
+                    }
+                });
+                document.querySelectorAll('iframe').forEach(function(f){
+                    out.iframes.push((f.src || '').slice(0, 120));
+                });
+                return out;
+            })()
+            """)
+            logger.warning(f"🔍 {self.masked} Turnstile DOM 快照: "
+                           f"{json.dumps(info, ensure_ascii=False)[:2000]}")
+        except Exception as e:
+            logger.warning(f"🔍 {self.masked} Turnstile DOM 快照失败: {e}")
 
     def _expand_turnstile(self):
         """展开 Turnstile widget，防止被 overflow:hidden 父容器裁剪"""
         try:
             self.driver.execute_script("""
             (function() {
-                var ts = document.querySelector('input[name="cf-turnstile-response"]');
-                if (!ts) return 'no-turnstile';
-                var el = ts;
+                var w = document.querySelector('.cf-turnstile');
+                if (!w) return 'no-widget';
+                var el = w;
                 for (var i = 0; i < 20; i++) {
                     el = el.parentElement;
                     if (!el) break;
@@ -166,13 +202,6 @@ class KataBumpRenew:
                         el.style.overflow = 'visible';
                     el.style.minWidth = 'max-content';
                 }
-                document.querySelectorAll('iframe').forEach(function(f){
-                    if (f.src && f.src.indexOf('challenges.cloudflare.com') !== -1) {
-                        f.style.width = '300px'; f.style.height = '65px';
-                        f.style.minWidth = '300px';
-                        f.style.visibility = 'visible'; f.style.opacity = '1';
-                    }
-                });
                 return 'done';
             })()
             """)
@@ -180,46 +209,51 @@ class KataBumpRenew:
             logger.warning(f"⚠️ {self.masked} 展开 Turnstile 失败: {e}")
 
     def _click_turnstile_checkbox(self):
-        """按 iframe 真实坐标点击复选框，失败则退回容器偏移点击"""
-        try:
-            iframe = self.driver.find_element(
-                By.CSS_SELECTOR,
-                ".cf-turnstile iframe[src*='challenges.cloudflare.com']")
-            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", iframe)
-            sleep_ms(300 + random.random() * 300)
-            r = iframe.rect
-            cx = r['width'] * 0.12 + random.uniform(-4, 4)
-            cy = r['height'] / 2 + random.uniform(-4, 4)
-            actions = ActionChains(self.driver)
-            actions.move_to_element_with_offset(iframe, cx, cy)
-            actions.pause(random.uniform(0.4, 0.7))
-            actions.click_and_hold()
-            actions.pause(random.uniform(0.1, 0.25))
-            actions.release()
-            actions.perform()
-            logger.info(f"🖱️ {self.masked} Turnstile iframe 坐标点击 ({cx:.0f}, {cy:.0f})")
-            return True
-        except Exception as e:
-            logger.warning(f"⚠️ {self.masked} iframe 定位失败: {e}，退回容器偏移点击")
+        """点击 Turnstile 复选框: 优先 iframe 真实坐标，退回容器偏移"""
+        for sel in [".cf-turnstile iframe[src*='challenges.cloudflare.com']",
+                    ".cf-turnstile iframe",
+                    "iframe[src*='challenges.cloudflare.com']"]:
             try:
-                container = self.driver.find_element(By.CLASS_NAME, "cf-turnstile")
-                size = container.size
-                base_x = -(size['width'] / 2) + (size['width'] * 0.12)
-                rand_x = base_x + random.uniform(-5, 5)
-                rand_y = random.uniform(-5, 5)
+                iframe = self.driver.find_element(By.CSS_SELECTOR, sel)
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'});", iframe)
+                sleep_ms(300 + random.random() * 300)
+                r = iframe.rect
+                # 复选框在 iframe 左侧，flexible 模式下 iframe 可能很宽，坐标封顶 45px
+                cx = min(45, r['width'] * 0.12) + random.uniform(-4, 4)
+                cy = r['height'] / 2 + random.uniform(-4, 4)
                 actions = ActionChains(self.driver)
-                actions.move_to_element(container)
-                actions.pause(random.uniform(0.5, 0.8))
-                actions.move_to_element_with_offset(container, rand_x, rand_y)
+                actions.move_to_element_with_offset(iframe, cx, cy)
+                actions.pause(random.uniform(0.4, 0.7))
                 actions.click_and_hold()
                 actions.pause(random.uniform(0.1, 0.25))
                 actions.release()
                 actions.perform()
-                logger.info(f"🖱️ {self.masked} Turnstile 容器偏移点击")
+                logger.info(f"🖱️ {self.masked} Turnstile iframe 坐标点击 ({sel}) ({cx:.0f}, {cy:.0f})")
                 return True
-            except Exception as e2:
-                logger.error(f"❌ {self.masked} Turnstile 点击失败: {e2}")
-                return False
+            except Exception:
+                continue
+
+        # 兜底: 容器偏移点击（目标为容器左缘 ~30px 复选框位置）
+        try:
+            container = self.driver.find_element(By.CLASS_NAME, "cf-turnstile")
+            size = container.size
+            base_x = 30 - (size['width'] / 2)
+            rand_x = base_x + random.uniform(-5, 5)
+            rand_y = random.uniform(-5, 5)
+            actions = ActionChains(self.driver)
+            actions.move_to_element(container)
+            actions.pause(random.uniform(0.5, 0.8))
+            actions.move_to_element_with_offset(container, rand_x, rand_y)
+            actions.click_and_hold()
+            actions.pause(random.uniform(0.1, 0.25))
+            actions.release()
+            actions.perform()
+            logger.info(f"🖱️ {self.masked} Turnstile 容器偏移点击")
+            return True
+        except Exception as e:
+            logger.error(f"❌ {self.masked} Turnstile 点击失败: {e}")
+            return False
 
     def _handle_turnstile(self, context="", max_attempts=6):
         """Cloudflare Turnstile — 展开 widget + 重试点击复选框"""
@@ -252,6 +286,7 @@ class KataBumpRenew:
                         return True
                     sleep_ms(1000)
 
+            self._turnstile_debug()
             logger.warning(f"⚠️ {self.masked} [{context}] Turnstile {max_attempts} 次尝试均超时")
             return False
         except Exception as e:
